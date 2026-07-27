@@ -77,6 +77,7 @@ AWS Free Tier is used as the real provisioning target for Terraform — because 
 ```
 standing-up-tnp/
 ├── posts/              the accompanying article series (Markdown, dev.to-ready)
+├── docs/               setup log and troubleshooting notes (raw, unpolished)
 ├── terraform/          IaC modules (tnp-infra)
 ├── ansible/             playbooks and inventory (tnp-ansible)
 ├── k8s-manifests/       Kubernetes manifests / GitOps configs
