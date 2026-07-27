@@ -116,3 +116,93 @@ to the volume group's full size before confirming.
 
 **Verify:** File system summary should show `/` at the full ~298GB with no
 "free space" line left in Available Devices.
+
+---
+
+## Grafana: CrashLoopBackOff — "Only one datasource per organization can be marked as default"
+
+**Symptom:** After installing `loki-stack` alongside `kube-prometheus-stack`
+in the same namespace, the Grafana pod goes into CrashLoopBackOff (2/3
+containers ready) and stays there indefinitely — deleting the pod doesn't
+help, a brand new pod hits the exact same error on next start.
+
+```
+kubectl logs -n monitoring <grafana-pod> -c grafana --previous
+logger=provisioning ... error="Datasource provisioning error: datasource.yaml
+config is invalid. Only one datasource per organization can be marked as default"
+```
+
+**Root cause:** Grafana's sidecar auto-discovers *any* ConfigMap labeled
+`grafana_datasource: "1"` in the namespace and merges them all at startup —
+not just the one belonging to `kube-prometheus-stack`. The `loki-stack` chart
+creates its own ConfigMap (`loki-loki-stack`) with the same label and
+`isDefault: true`, even when installed with `grafana.enabled=false`. That
+flag only skips installing a *second Grafana instance* — it does nothing to
+stop the chart from creating its own datasource ConfigMap. Two ConfigMaps,
+two datasources both claiming default, Grafana refuses to start.
+
+Confirmed by comparing the two ConfigMaps directly:
+
+```bash
+kubectl get configmap -n monitoring -l grafana_datasource=1
+# NAME                                       AGE
+# kube-prometheus-stack-grafana-datasource   ...
+# loki-loki-stack                            ...   <- the extra one
+
+kubectl get configmap -n monitoring loki-loki-stack -o yaml
+# isDefault: true   <- conflicts with Prometheus's isDefault: true
+```
+
+Restarting the pod alone does not fix this — the ConfigMap causing the
+conflict is still there and gets re-read on every startup.
+
+**Fix:** Disable the `loki-stack` chart's own datasource sidecar, since a
+second, independently-managed data source ConfigMap is the wrong pattern
+here regardless of the default-flag conflict:
+
+```bash
+helm upgrade loki grafana/loki-stack \
+  --namespace monitoring \
+  --reuse-values \
+  --set grafana.sidecar.datasources.enabled=false
+
+kubectl delete pod -n monitoring -l app.kubernetes.io/name=grafana
+```
+
+Then add Loki as a data source the correct way — through
+`kube-prometheus-stack`'s own values, which already owns the datasource
+ConfigMap Grafana is provisioned from:
+
+```yaml
+# loki-datasource-values.yaml
+grafana:
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      url: http://loki:3100
+      access: proxy
+      isDefault: false
+```
+
+```bash
+helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --reuse-values \
+  -f loki-datasource-values.yaml
+```
+
+**Verify:**
+
+```bash
+kubectl get pods -n monitoring | grep grafana   # 3/3 Running, RESTARTS not climbing
+```
+
+Check **Connections → Data sources** in the Grafana UI — Loki should be
+listed, `isDefault` unchecked, Prometheus still the default.
+
+**Lesson:** Whenever two Helm charts each ship a Grafana-sidecar-discoverable
+ConfigMap (the `grafana_datasource: "1"` label pattern), assume they will
+collide on `isDefault` unless proven otherwise. Prefer wiring additional
+data sources through the chart that already owns Grafana
+(`additionalDataSources` in `kube-prometheus-stack`) instead of installing a
+second chart with its own auto-provisioning sidecar.
