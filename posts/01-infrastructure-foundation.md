@@ -96,25 +96,25 @@ Two virtual networks, doing two very different jobs:
 
 | vmnet | Type | Subnet | DHCP | Purpose |
 |---|---|---|---|---|
-| vmnet8 | NAT | 192.168.100.0/24 | On | Internet access for every VM |
-| vmnet1 | Host-only | 192.168.110.0/24 | **Off** | Lab network, static IPs |
+| vmnet8 | NAT | 192.168.192.0/24 | On | Internet access for every VM |
+| vmnet1 | Host-only | 192.168.10.0/24 | **Off** | Lab network, static IPs |
 
 Every VM gets two NICs — one on each network. DHCP is deliberately off on the lab network. A lab you're reasoning about (which service talks to which, what's the IP for the GitLab runner, why can't devbox reach cicd) is not a place where you want addresses that might change on you.
 
 ```
-devbox        192.168.110.10
-cicd          192.168.110.11
-rocky-01      192.168.110.21
-rocky-02      192.168.110.22
-ubuntu-01     192.168.110.23
-ubuntu-02     192.168.110.24
+devbox        192.168.10.10
+cicd          192.168.10.11
+rocky-01      192.168.10.21
+rocky-02      192.168.10.22
+ubuntu-01     192.168.10.23
+ubuntu-02     192.168.10.24
 ```
 
 A local `hosts` file entry on the Windows host makes the dashboards reachable by name instead of IP:
 
 ```
-192.168.110.10  devbox grafana.tnp.internal prom.tnp.internal
-192.168.110.11  gitlab.tnp.internal harbor.tnp.internal sonar.tnp.internal
+192.168.10.10  devbox grafana.tnp.internal prom.tnp.internal
+192.168.10.11  gitlab.tnp.internal harbor.tnp.internal sonar.tnp.internal
 ```
 
 Opening `http://grafana.tnp.internal:3000` from Chrome on the host works exactly like it would on a real internal network — no port-forwarding gymnastics required, because host-only networking already gives Windows direct routing to every VM's static IP.
