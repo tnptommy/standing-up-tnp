@@ -46,8 +46,8 @@ Windows Host (64GB RAM, VMware Workstation Pro)
 ├── cicd        GitLab CE · Harbor · SonarQube
 │
 └── 4x Linux VMs   Ansible targets
-    ├── rocky-01 / rocky-02    Rocky Linux 9
-    └── ubuntu-01 / ubuntu-02  Ubuntu 24.04
+    ├── rocky-01 / rocky-02    Rocky Linux 10
+    └── ubuntu-01 / ubuntu-02  Ubuntu 26.04 LTS
 ```
 
 AWS Free Tier is used as the real provisioning target for Terraform — because a lab that only ever runs `terraform apply` against local containers never teaches the parts that actually matter in production.

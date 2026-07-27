@@ -50,16 +50,16 @@ The trade-off: no WSL2, no Docker Desktop, no Windows Sandbox. None of that matt
 
 | VM | OS | RAM | vCPU | Disk | Role |
 |---|---|---|---|---|---|
-| **devbox** | Ubuntu 24.04 | 32GB | 10 | 300GB thin | Docker, k3d, Terraform, Ansible, Prometheus/Grafana/Loki |
-| **cicd** | Ubuntu 24.04 | 20GB | 6 | 150GB thin | GitLab CE, Harbor, SonarQube |
+| **devbox** | Ubuntu 26.04 LTS | 32GB | 10 | 300GB thin | Docker, k3d, Terraform, Ansible, Prometheus/Grafana/Loki |
+| **cicd** | Ubuntu 26.04 LTS | 20GB | 6 | 150GB thin | GitLab CE, Harbor, SonarQube |
 | Windows host | — | 8GB | 2 | — | Hypervisor, VS Code Remote-SSH, browser |
 
 Plus four small Ansible targets — deliberately not identical:
 
 | VM | OS | RAM |
 |---|---|---|
-| rocky-01, rocky-02 | Rocky Linux 9 | 1GB each |
-| ubuntu-01, ubuntu-02 | Ubuntu 24.04 | 1GB each |
+| rocky-01, rocky-02 | Rocky Linux 10 | 1GB each |
+| ubuntu-01, ubuntu-02 | Ubuntu 26.04 LTS | 1GB each |
 
 Total when everything is running: **64GB**, fully used, no headroom left to spare. That's intentional — I'd rather size tight and know exactly where the ceiling is than leave vague slack I can't account for.
 

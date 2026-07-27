@@ -104,8 +104,8 @@ Windows Host (64GB RAM, VMware Workstation Pro)
 ├── cicd        GitLab CE · Harbor · SonarQube
 │
 └── 4x Linux VMs   Ansible targets
-    ├── rocky-01 / rocky-02    Rocky Linux 9
-    └── ubuntu-01 / ubuntu-02  Ubuntu 24.04
+    ├── rocky-01 / rocky-02    Rocky Linux 10
+    └── ubuntu-01 / ubuntu-02  Ubuntu 26.04 LTS
 ```
 
 The four Ansible targets are deliberately **not identical** — two Rocky, two Ubuntu — so playbooks have to actually handle differences: SELinux vs AppArmor, firewalld vs ufw, dnf vs apt.
