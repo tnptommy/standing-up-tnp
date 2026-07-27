@@ -117,7 +117,7 @@ A local `hosts` file entry on the Windows host makes the dashboards reachable by
 192.168.10.11  gitlab.tnp.internal harbor.tnp.internal sonar.tnp.internal
 ```
 
-Opening `http://grafana.tnp.internal:3000` from Chrome on the host works exactly like it would on a real internal network — no port-forwarding gymnastics required, because host-only networking already gives Windows direct routing to every VM's static IP.
+Opening `https://grafana.tnp.internal:3000` from Chrome on the host works exactly like it would on a real internal network — no port-forwarding gymnastics required, because host-only networking already gives Windows direct routing to every VM's static IP.
 
 ---
 
