@@ -206,3 +206,135 @@ collide on `isDefault` unless proven otherwise. Prefer wiring additional
 data sources through the chart that already owns Grafana
 (`additionalDataSources` in `kube-prometheus-stack`) instead of installing a
 second chart with its own auto-provisioning sidecar.
+
+---
+
+## Harbor: Docker login fails — "certificate relies on legacy Common Name field"
+
+**Symptom:** Browsers accept the self-signed cert for Harbor (after clicking
+through the warning), but `docker login harbor.tnp.internal` fails:
+
+```
+Error response from daemon: Get "https://harbor.tnp.internal/v2/":
+tls: failed to verify certificate: x509: certificate relies on legacy
+Common Name field, use SANs instead
+```
+
+**Root cause:** The cert was generated with only a Common Name
+(`-subj "/CN=harbor.tnp.internal"`), no Subject Alternative Name. Browsers
+still tolerate CN-only certs; Go's TLS stack (which Docker's daemon uses)
+does not — SAN has been required for hostname verification for years now,
+and CN-only certs are silently rejected regardless of trust store.
+
+**Fix:** Regenerate the certificate with an explicit SAN via an OpenSSL
+config file:
+
+```bash
+cat > harbor-openssl.cnf <<EOF
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = harbor.tnp.internal
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = harbor.tnp.internal
+IP.1 = 192.168.10.11
+EOF
+
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout harbor.tnp.internal.key \
+  -out harbor.tnp.internal.crt \
+  -config harbor-openssl.cnf \
+  -extensions v3_req
+```
+
+**Critical follow-up step, easy to miss:** regenerating the cert file on disk
+is not enough. Harbor has a `prepare` step that reads `harbor.yml` and
+writes the actual runtime config (including certs) that containers use.
+Just restarting containers reuses the stale runtime config:
+
+```bash
+cd ~/harbor
+sudo ./prepare
+sudo docker compose down
+sudo docker compose up -d
+```
+
+Then re-copy the new cert to any Docker client that needs to trust it:
+
+```bash
+# on the client (e.g. devbox)
+sudo nano /etc/docker/certs.d/harbor.tnp.internal/ca.crt   # paste new cert
+sudo systemctl restart docker
+```
+
+**Verify:**
+
+```bash
+echo | openssl s_client -connect harbor.tnp.internal:443 \
+  -servername harbor.tnp.internal 2>/dev/null \
+  | openssl x509 -noout -text | grep -A 2 "Subject Alternative Name"
+# should show DNS + IP entries
+
+docker login harbor.tnp.internal   # Login Succeeded
+```
+
+**Lesson:** For any self-hosted service that has a "prepare / generate
+config" step in its install process (Harbor, and likely others), changing
+the cert file on disk and restarting the container is not sufficient —
+the prepare step must be re-run first, or the service keeps serving
+whatever it baked into its runtime config at install time.
+
+---
+
+## SonarQube: CrashLoop — "Failed to create temporary configuration directory [/opt/sonarqube/data/es8/config]"
+
+**Symptom:** SonarQube container stuck restarting, logs show Elasticsearch
+repeatedly failing to launch:
+
+```
+java.lang.IllegalStateException: Failed to create temporary configuration
+directory [/opt/sonarqube/data/es8/config]
+```
+
+`vm.max_map_count` was already correctly set to 262144 — not the cause here,
+despite being the most commonly cited fix for this exact error message online.
+
+**Root cause:** The host directories mounted into the container
+(`/srv/sonarqube/data`, `/logs`, `/extensions`) were created with `sudo
+mkdir`, so they're owned by `root`. The SonarQube container runs as UID
+`1000`, not root, and can't write to root-owned directories — so
+Elasticsearch can't create its config directory at startup.
+
+**Fix:**
+
+```bash
+sudo chown -R 1000:1000 /srv/sonarqube/data /srv/sonarqube/logs /srv/sonarqube/extensions
+docker compose down
+docker compose up -d
+```
+
+Note: the PostgreSQL data directory (`/srv/sonarqube/postgresql`) does **not**
+need this — that container manages its own UID (`999`) internally and
+already had correct ownership.
+
+**Verify:**
+
+```bash
+docker compose logs -f sonarqube   # wait for "SonarQube is operational"
+curl -I http://localhost:9000       # HTTP 200
+```
+
+**Lesson:** Any host directory bind-mounted into a container needs its
+ownership checked against the UID the container actually runs as — not
+assumed to be root or the host user. This bites hardest with JVM-based
+images (SonarQube, Elasticsearch, and similar) which very commonly run
+as a fixed non-root UID baked into the image.

@@ -270,3 +270,202 @@ verified log ingestion via **Explore** with query `{namespace="monitoring"}`.
 - [ ] rocky-01/02, ubuntu-01/02 (Ansible lab targets)
 - [ ] Terraform + AWS Free Plan target
 - [ ] DevSecOps pipeline (gitleaks, Trivy, checkov/tfsec wired into CI)
+
+---
+
+# Setup Log — cicd
+
+Same format as above. VM created identically to devbox (see Part 1 /
+`posts/01-infrastructure-foundation.md`), just resized: 20GB RAM, 6 vCPU,
+150GB disk, static IP `192.168.10.11`, hostname `cicd`.
+
+## Post-install base setup
+
+```bash
+sudo apt update && sudo apt upgrade -y
+
+# Swap — 10GB (50% of RAM, same ratio used on devbox)
+sudo fallocate -l 10G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Applied the inotify fix from devbox proactively this time —
+# GitLab (Sidekiq, Puma, Gitaly) also needs plenty of inotify watches
+echo 'fs.inotify.max_user_instances=1024' | sudo tee -a /etc/sysctl.conf
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker tnpadmin
+```
+
+## GitLab CE
+
+```bash
+sudo mkdir -p /srv/gitlab/config /srv/gitlab/logs /srv/gitlab/data
+
+sudo docker run --detach \
+  --hostname gitlab.tnp.internal \
+  --publish 8443:443 --publish 8080:80 --publish 2222:22 \
+  --name gitlab \
+  --restart always \
+  --volume /srv/gitlab/config:/etc/gitlab \
+  --volume /srv/gitlab/logs:/var/log/gitlab \
+  --volume /srv/gitlab/data:/var/opt/gitlab \
+  --shm-size 256m \
+  gitlab/gitlab-ce:latest
+```
+
+Self-signed cert for `gitlab.tnp.internal`, then inside the container:
+
+```bash
+docker exec -it gitlab bash
+vi /etc/gitlab/gitlab.rb
+# external_url 'https://gitlab.tnp.internal'
+# nginx['redirect_http_to_https'] = true
+# nginx['ssl_certificate'] = "/etc/gitlab/ssl/gitlab.tnp.internal.crt"
+# nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/gitlab.tnp.internal.key"
+exit
+docker exec -it gitlab gitlab-ctl reconfigure
+```
+
+Post-setup: disabled public sign-up, created group `tnp-technologies`,
+created 4 projects (`tnp-pay-api`, `tnp-pay-web`, `tnp-infra`,
+`tnp-ansible`). On each: protected `main` (no one can push directly,
+merge via MR only), merge method set to "merge commit with semi-linear
+history" + automatic rebase, "Pipelines must succeed" and "All threads
+must be resolved" enabled as merge gates.
+
+> Note: GitLab CE (free) does not include Approval Rules (requiring N
+> reviewers) — that's a Premium/Ultimate feature. The two merge checks
+> above are the closest CE equivalent.
+
+Verified end-to-end: SSH key for `tnpadmin` added to GitLab, cloned
+`tnp-pay-api` from `devbox` over SSH (port 2222, configured via
+`~/.ssh/config`), confirmed direct push to `main` is rejected
+(`pre-receive hook declined`).
+
+## Harbor v2.15.2
+
+```bash
+cd ~
+wget https://github.com/goharbor/harbor/releases/download/v2.15.2/harbor-online-installer-v2.15.2.tgz
+tar xzvf harbor-online-installer-v2.15.2.tgz
+cd harbor
+
+sudo mkdir -p /srv/harbor/ssl /srv/harbor/data
+cd /srv/harbor/ssl
+# see troubleshooting.md — first attempt used CN-only cert, had to redo
+# with SAN via an openssl config file
+cd ~/harbor
+
+cp harbor.yml.tmpl harbor.yml
+# hostname: harbor.tnp.internal
+# http.port: 80, https.port: 443 (kept as defaults — GitLab uses 8443/8080,
+# no conflict, and skipping the port in every docker/curl command is nicer)
+
+sudo ./install.sh
+```
+
+Created project `tnp-pay` (private). Verified with a real push:
+
+```bash
+docker login harbor.tnp.internal
+docker pull hello-world
+docker tag hello-world harbor.tnp.internal/tnp-pay/hello-world:test
+docker push harbor.tnp.internal/tnp-pay/hello-world:test
+```
+
+## SonarQube (Community Build)
+
+```bash
+sudo sysctl -w vm.max_map_count=262144
+echo 'vm.max_map_count=262144' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+sudo mkdir -p /srv/sonarqube/data /srv/sonarqube/logs /srv/sonarqube/extensions /srv/sonarqube/postgresql
+```
+
+`docker-compose.yml`:
+
+```yaml
+services:
+  sonarqube:
+    image: sonarqube:community
+    container_name: sonarqube
+    depends_on:
+      - db
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: <redacted>
+    volumes:
+      - /srv/sonarqube/data:/opt/sonarqube/data
+      - /srv/sonarqube/logs:/opt/sonarqube/logs
+      - /srv/sonarqube/extensions:/opt/sonarqube/extensions
+    ports:
+      - "9000:9000"
+    restart: always
+
+  db:
+    image: postgres:17
+    container_name: sonarqube-db
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: <redacted>
+      POSTGRES_DB: sonar
+    volumes:
+      - /srv/sonarqube/postgresql:/var/lib/postgresql/data
+    restart: always
+```
+
+Hit the UID/permission CrashLoop here — see `troubleshooting.md`. Fixed with
+`chown -R 1000:1000` on the mounted directories, then:
+
+```bash
+docker compose up -d
+```
+
+Created project `tnp-pay-api` as a **local project** (not "Import from
+GitLab" — that path needs the GitLab self-signed cert to be trusted by
+SonarQube first, unnecessary friction for a repo that doesn't have code
+yet). Generated an analysis token, installed the scanner:
+
+```bash
+mkdir -p ~/.npm-global
+npm config set prefix '~/.npm-global'
+echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+
+npm install -g @sonar/scan
+```
+
+> The package is `@sonar/scan`, but the actual binary it installs is
+> `sonar-scanner-npm` — not `sonar` or `sonar-scanner`. Check
+> `package.json`'s `bin` field if a fresh install ever renames it again.
+
+Ran a connectivity test from `devbox` (repo only had a README at this
+point, so 0 files analyzed — the point was just confirming the scanner
+reaches the server):
+
+```bash
+sonar-scanner-npm \
+  -Dsonar.host.url=http://192.168.10.11:9000 \
+  -Dsonar.token=<redacted> \
+  -Dsonar.projectKey=tnp-pay-api
+```
+
+Result: `ANALYSIS SUCCESSFUL`.
+
+## Status as of this log
+
+- [x] GitLab CE — HTTPS, 4 repos, branch protection, merge gates verified
+- [x] Harbor — HTTPS (SAN cert), project `tnp-pay`, push verified
+- [x] SonarQube — project `tnp-pay-api`, scanner connectivity verified
+- [ ] Real backend code for `tnp-pay-api` (Node.js 22 + TypeScript + Express)
+- [ ] Real frontend code for `tnp-pay-web` (React/Vue, served via Nginx)
+- [ ] GitLab CI pipeline wiring SonarQube + Trivy + Harbor push
+- [ ] rocky-01/02, ubuntu-01/02 (Ansible lab targets)
+- [ ] Terraform + AWS Free Plan target
