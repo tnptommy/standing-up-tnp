@@ -469,3 +469,189 @@ Result: `ANALYSIS SUCCESSFUL`.
 - [ ] GitLab CI pipeline wiring SonarQube + Trivy + Harbor push
 - [ ] rocky-01/02, ubuntu-01/02 (Ansible lab targets)
 - [ ] Terraform + AWS Free Plan target
+
+---
+
+# Setup Log — Ansible lab (web-rocky, web-ubuntu, db-rocky, db-ubuntu)
+
+Renamed from the OS-only scheme (rocky-01/02, ubuntu-01/02) to a
+role+OS scheme before cloning — keeps the multi-OS learning value (name
+still tells you Rocky vs Ubuntu) while adding role context.
+
+## Templates
+
+`tmpl-rocky10` (Rocky Linux 10 minimal) and `tmpl-ubuntu26`
+(Ubuntu 26.04 minimal), each 2GB RAM / 2 vCPU / 16GB disk, NAT only.
+
+Prepped identically before snapshotting:
+
+```bash
+# Rocky
+sudo dnf install -y python3 open-vm-tools   # NOT qemu-guest-agent — that's
+sudo systemctl enable --now vmtoolsd         # for QEMU/KVM, not VMware
+
+# Ubuntu
+sudo apt install -y python3 open-vm-tools
+sudo cloud-init clean --logs
+```
+
+Both, before shutdown + snapshot `base`:
+
+```bash
+sudo truncate -s 0 /etc/machine-id
+sudo rm -f /var/lib/dbus/machine-id
+sudo mkdir -p /var/lib/dbus            # dir didn't exist on Rocky by default
+sudo ln -sf /etc/machine-id /var/lib/dbus/machine-id
+sudo rm -f /etc/ssh/ssh_host_*          # regenerated fresh on next boot
+```
+
+SSH public key for `tnpadmin` (from devbox) copied into
+`~/.ssh/authorized_keys` on each template before snapshotting.
+
+## Cloning + networking
+
+Linked-cloned 4 VMs from the two `base` snapshots, added a second NIC
+(VMnet1) to each, then per VM:
+
+```bash
+# Rocky (nmcli)
+sudo hostnamectl set-hostname web-rocky
+sudo nmcli con mod <iface> ipv4.addresses 192.168.10.21/24
+sudo nmcli con mod <iface> ipv4.method manual
+sudo nmcli con up <iface>
+
+# Ubuntu (netplan)
+sudo hostnamectl set-hostname web-ubuntu
+# edit /etc/netplan/50-cloud-init.yaml, add the vmnet1 iface block
+sudo netplan apply
+```
+
+| VM | OS | IP |
+|---|---|---|
+| web-rocky | Rocky Linux 10 | 192.168.10.21 |
+| web-ubuntu | Ubuntu 26.04 | 192.168.10.22 |
+| db-rocky | Rocky Linux 10 | 192.168.10.23 |
+| db-ubuntu | Ubuntu 26.04 | 192.168.10.24 |
+
+Added all four to `/etc/hosts` on devbox, cicd, and the Windows host.
+
+## Ansible setup (on devbox)
+
+```bash
+sudo apt install -y pipx
+pipx ensurepath
+pipx install --include-deps ansible   # core 2.21.2
+```
+
+`~/tnp-ansible-work/inventory.ini`:
+
+```ini
+[rocky]
+web-rocky ansible_host=192.168.10.21
+db-rocky ansible_host=192.168.10.23
+
+[ubuntu]
+web-ubuntu ansible_host=192.168.10.22
+db-ubuntu ansible_host=192.168.10.24
+
+[all:vars]
+ansible_user=tnpadmin
+ansible_python_interpreter=/usr/bin/python3
+```
+
+```bash
+ssh-keyscan -H 192.168.10.21 >> ~/.ssh/known_hosts
+ssh-keyscan -H 192.168.10.22 >> ~/.ssh/known_hosts
+ssh-keyscan -H 192.168.10.23 >> ~/.ssh/known_hosts
+ssh-keyscan -H 192.168.10.24 >> ~/.ssh/known_hosts
+
+ansible all -i inventory.ini -m ping   # all 4 SUCCESS
+```
+
+Hit the sudo-rs prompt-matching issue on both Ubuntu hosts here — see
+`troubleshooting.md`. Fixed with manual NOPASSWD setup per host, then ran
+the first real playbook (`site.yml`): installs Nginx, opens the firewall
+(firewalld on Rocky, ufw on Ubuntu), deploys a per-host index page.
+`PLAY RECAP` came back `failed=0` across all four hosts, verified with
+`curl` against each IP showing the correct hostname/OS/distribution.
+
+---
+
+# Setup Log — tnp-pay-api (first real code)
+
+Stack: Node.js 22 + TypeScript + Express + `pg`, on `devbox`.
+
+```bash
+cd ~/tnp-pay-api
+npm init -y
+npm install express pg dotenv
+npm install -D typescript @types/node @types/express ts-node-dev
+```
+
+Swapped `ts-node-dev` for `tsx` immediately — `npm audit` showed 5 high
+severity vulnerabilities, all originating from `ts-node-dev`'s outdated
+`rimraf`/`glob`/`minimatch`/`brace-expansion` chain:
+
+```bash
+npm uninstall ts-node-dev
+npm install -D tsx
+npm audit   # 0 vulnerabilities after the swap
+```
+
+Structure:
+
+```
+src/
+├── config/db.ts     # pg Pool
+├── routes/health.ts # GET /api/health
+└── index.ts
+```
+
+Hit the `dotenv.config()` ordering bug here (see `troubleshooting.md`) —
+had it only in `index.ts`, `db.ts`'s `Pool` was constructed with an empty
+`process.env` because ES Module imports are hoisted above other top-level
+code. Fixed by calling `dotenv.config()` at the top of `db.ts` directly.
+
+PostgreSQL via a separate compose file, not bundled with the app:
+
+```yaml
+# docker-compose.db.yml
+services:
+  tnp-pay-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: tnp_pay
+      POSTGRES_USER: tnp_pay
+      POSTGRES_PASSWORD: '<redacted>'   # single-quoted — value has $ in it
+    ports:
+      - "5432:5432"
+    volumes:
+      - ~/tnp-pay-db-data:/var/lib/postgresql/data
+```
+
+Hit a password-mismatch issue between `.env` and the compose file — see
+`troubleshooting.md`. Root cause was partly a stale volume (changed
+`POSTGRES_PASSWORD` after first init, container ignored the new value)
+and partly an unquoted `$` in the password. Fixed by wiping the volume and
+re-syncing both files with a single, quoted value.
+
+**Verified end to end:**
+
+```bash
+curl http://localhost:3000/api/health
+# {"status":"ok","service":"tnp-pay-api","db":"connected"}
+```
+
+## Status as of this log
+
+- [x] devbox, cicd fully set up
+- [x] 4 Ansible lab VMs, first playbook run successfully
+- [x] `tnp-pay-api` — real code, connects to Postgres, `/health` verified
+- [ ] Commit `tnp-pay-api` to GitLab via MR (branch protection is live —
+      no direct push to `main`)
+- [ ] Real SonarQube scan against actual code (previous scan only saw a
+      README)
+- [ ] Build + push a real image to Harbor
+- [ ] `tnp-pay-web` frontend
+- [ ] `.gitlab-ci.yml` wiring build → scan → push
+- [ ] Terraform + AWS Free Plan target

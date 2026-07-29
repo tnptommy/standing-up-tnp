@@ -402,3 +402,148 @@ or credentials problem, even though the underlying command works fine by
 hand. Worth checking "did a core utility change implementation" before
 assuming a config or network issue when only one OS in a mixed inventory
 misbehaves.
+
+---
+
+## Node/TypeScript: `db: unreachable` despite a correct `.env` file
+
+**Symptom:** `tnp-pay-api`'s `/api/health` endpoint always reports
+`"db": "unreachable"`, even after confirming: PostgreSQL container is
+running, `psql` connects fine manually, the right port is listening,
+`.env` has the correct host/port/credentials, and the dev server was
+restarted after every `.env` change.
+
+**Root cause:** `dotenv.config()` was called at the top of `index.ts`, with
+`pool = new Pool({...})` living in a separately-imported `db.ts`. In an ES
+Module, **all `import` statements are hoisted and execute before any other
+top-level code in the file** — regardless of where they appear textually.
+So the real execution order was:
+
+```
+import express
+import dotenv
+import healthRouter  →  which imports db.ts  →  new Pool() runs HERE,
+                         with process.env still empty
+dotenv.config()          ← runs last, too late for db.ts
+```
+
+`db.ts`'s `Pool` constructor ran before `dotenv.config()` had populated
+`process.env`, so it silently fell back to hardcoded defaults —
+never actually reading the real `.env` values.
+
+**Fix:** Call `dotenv.config()` at the very top of every file that reads
+`process.env` at module load time, not just the entrypoint:
+
+```typescript
+// src/config/db.ts
+import { Pool } from 'pg';
+import dotenv from 'dotenv';
+
+dotenv.config();   // must be here, not just in index.ts
+
+export const pool = new Pool({ /* ... */ });
+```
+
+**Verify:** Add a temporary `console.log` of the resolved config values
+right after `dotenv.config()` and confirm they match `.env` — not the
+hardcoded fallback defaults.
+
+**Lesson:** In any module that does environment-dependent work at import
+time (not inside a function), assume `dotenv.config()` in a *different*
+file will not have run yet. Load env in the module that needs it, not just
+once at the entrypoint.
+
+---
+
+## PostgreSQL (Docker): "password authentication failed" despite matching `.env`
+
+**Symptom:** `pg` throws `password authentication failed for user "..."`
+even though the password in `.env` was carefully copied from the same
+place as `POSTGRES_PASSWORD` in `docker-compose.db.yml`.
+
+**Root cause:** Two separate issues, both worth checking:
+
+1. **Stale volume.** `POSTGRES_PASSWORD` is only read once — the first time
+   the Postgres container initializes an *empty* data directory. If the
+   password in `docker-compose.db.yml` is changed after the container has
+   already run once, the running database still has the *original*
+   password baked in; the compose file value is now just wrong-but-unused.
+2. **Unquoted special characters in YAML.** A generated password containing
+   `$` (e.g. `openssl rand -base64` output) can be partially interpreted as
+   a shell/YAML variable reference if left unquoted, silently mangling the
+   value Postgres actually receives.
+
+**Fix:**
+
+```bash
+docker compose -f docker-compose.db.yml down
+rm -rf ~/tnp-pay-db-data   # wipes the stale volume — fine for a dev DB with no real data yet
+```
+
+Set the same password in both files, single-quoted in the compose file:
+
+```yaml
+POSTGRES_PASSWORD: 'gJ7]AdY.u5|EVGyb=[u='
+```
+
+```bash
+docker compose -f docker-compose.db.yml up -d
+```
+
+**Verify:**
+
+```bash
+docker exec -it tnp-pay-db psql -U tnp_pay -d tnp_pay -c "SELECT 1;"
+curl http://localhost:3000/api/health   # {"status":"ok", ..., "db":"connected"}
+```
+
+**Lesson:** Prefer generating passwords without shell/YAML-special
+characters for anything going into a compose file or `.env`:
+
+```bash
+openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32
+```
+
+And remember that changing `POSTGRES_PASSWORD` on an already-initialized
+volume is a no-op — the fix is always to reset the volume, not just the
+config.
+
+---
+
+## dotenv: unexpected "tip" message in console output — not a supply-chain issue
+
+**Symptom:** `npm run dev` prints an unfamiliar line alongside the expected
+`dotenv` output, referencing an external domain:
+
+```
+◇ injected env (0) from .env // tip: ⌁ auth for agents [www.vestauth.com]
+```
+
+This looks alarming out of context — an unfamiliar domain name printed by
+a dependency is a classic supply-chain-compromise red flag, and it's worth
+treating that way by default.
+
+**Investigation:** Rather than assume it's malicious or dismiss it,
+searched for the exact string across `node_modules`:
+
+```bash
+grep -r "vestauth" node_modules/ -l
+# node_modules/dotenv/CHANGELOG.md
+# node_modules/dotenv/lib/main.js
+```
+
+Both hits are inside `dotenv`'s own official package files, not a nested
+or typosquatted dependency — confirming the message originates from the
+real, official `dotenv` package.
+
+**Conclusion:** Not a compromise. `dotenv`'s maintainer has a known history
+of printing promotional "tip" messages for their commercial product
+(`dotenvx`) directly in console output. Noisy and arguably bad practice for
+a widely-used library, but not malicious.
+
+**Lesson:** Treat unfamiliar strings/domains from a dependency as suspicious
+by default, but verify before reacting — `grep` the string across
+`node_modules` to see exactly which package prints it and whether it's
+coming from the real package's own source (self-promotion) versus an
+injected or typosquatted one (compromise). The check takes seconds and
+turns a guess into a fact either way.
