@@ -547,3 +547,96 @@ by default, but verify before reacting — `grep` the string across
 coming from the real package's own source (self-promotion) versus an
 injected or typosquatted one (compromise). The check takes seconds and
 turns a guess into a fact either way.
+
+---
+
+## Docker build: `tsc` fails on missing `@types/pg`, but `npm run dev` never caught it
+
+**Symptom:** `npm run dev` (via `tsx`) works fine against `db.ts` importing
+`pg`. The Dockerfile's build stage, running `tsc` via `npm run build`,
+fails:
+
+```
+src/config/db.ts(1,22): error TS7016: Could not find a declaration file
+for module 'pg'. '/app/node_modules/pg/esm/index.mjs' implicitly has an
+'any' type.
+```
+
+**Root cause:** `tsx` transpiles TypeScript without running a full type
+check — it strips types and runs the JavaScript, so a missing `@types/*`
+package for a dependency doesn't block it. `tsc` (used for the actual
+production build) does full type checking and refuses to compile with an
+implicit `any` from an untyped module. `@types/pg` was never installed
+alongside `pg` itself.
+
+**Fix:**
+
+```bash
+npm install -D @types/pg
+```
+
+**Verify:**
+
+```bash
+docker build -t harbor.tnp.internal/tnp-pay/tnp-pay-api:v0.1.0 .
+# build stage's `npm run build` now succeeds
+```
+
+**Lesson:** `tsx`/`ts-node`-style dev runners are not a substitute for
+actually running `tsc` before considering code done — they optimize for
+fast iteration, not correctness. Building the Docker image (or running
+`npm run build` directly) is what actually catches missing type
+declarations, strict-mode violations, and other issues dev mode silently
+tolerates. Worth doing a real build periodically during development, not
+just at the end.
+
+---
+
+## Harbor: all containers except `harbor-log` silently stopped
+
+**Symptom:** `docker login harbor.tnp.internal` fails with
+`connect: connection refused` on port 443, despite Harbor having worked
+fine in a previous session. `docker ps` on the Harbor host shows only one
+container running:
+
+```
+harbor-log   Up 2 hours (healthy)
+```
+
+Core, db, portal, registry, proxy/nginx, trivy-adapter, redis, and
+jobservice are all gone.
+
+**Root cause:** Not fully diagnosed — Harbor's Compose stack stopped on its
+own between sessions. Possibly related to host resource pressure, a Docker
+daemon restart, or the VM being suspended/resumed rather than cleanly
+rebooted (a VM suspend can leave containers in an inconsistent state that
+Docker doesn't automatically recover from).
+
+**Fix:**
+
+```bash
+cd ~/harbor
+sudo docker compose up -d
+docker compose ps   # wait for all services to report healthy/running
+```
+
+**Verify:**
+
+```bash
+docker ps | grep harbor   # should show ~8-9 containers again
+```
+
+From another host:
+
+```bash
+docker login harbor.tnp.internal   # Login Succeeded
+```
+
+**Lesson:** Self-hosted Docker Compose stacks on a lab VM aren't guaranteed
+to survive VM suspend/resume or host reboots the same way a properly
+`restart: always`-configured systemd-managed service would. Worth checking
+`docker ps` on any Compose-based service (Harbor, GitLab if run outside its
+own init system, SonarQube) at the start of a session before assuming it's
+still up from last time — and worth investigating whether `restart: always`
+in the compose file is actually being honored across VM power-cycles, not
+just container crashes.

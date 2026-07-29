@@ -647,11 +647,18 @@ curl http://localhost:3000/api/health
 - [x] devbox, cicd fully set up
 - [x] 4 Ansible lab VMs, first playbook run successfully
 - [x] `tnp-pay-api` — real code, connects to Postgres, `/health` verified
-- [ ] Commit `tnp-pay-api` to GitLab via MR (branch protection is live —
-      no direct push to `main`)
-- [ ] Real SonarQube scan against actual code (previous scan only saw a
-      README)
-- [ ] Build + push a real image to Harbor
+- [x] Committed `tnp-pay-api` to GitLab via MR (branch protection verified —
+      direct push to `main` rejected as expected)
+- [x] Real SonarQube scan against actual TypeScript code
+- [x] Docker image built and pushed to Harbor
+      (`harbor.tnp.internal/tnp-pay/tnp-pay-api:v0.1.0`)
+- [x] Fixed missing `@types/pg` (caught by `tsc` in the Docker build, not
+      by `tsx` in dev mode) via a second MR
 - [ ] `tnp-pay-web` frontend
-- [ ] `.gitlab-ci.yml` wiring build → scan → push
+- [ ] `.gitlab-ci.yml` wiring build → scan → push into an actual pipeline
 - [ ] Terraform + AWS Free Plan target
+
+Manual chain now verified end to end: write code on `devbox` → push →
+GitLab MR (branch protection + merge gates enforced) → SonarQube scan →
+`docker build` → `docker push` to Harbor. Next step is automating this
+chain instead of running each stage by hand.
