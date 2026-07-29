@@ -62,7 +62,7 @@ AWS Free Tier is used as the real provisioning target for Terraform — because 
 | 1 | Infrastructure Foundation | ✅ Draft ready |
 | 2 | Multi-OS Configuration Management with Ansible | ✅ Draft ready |
 | 3 | Building a Self-Hosted CI/CD Platform | ✅ Draft ready |
-| 4 | Kubernetes & Observability | ⏳ Not started |
+| 4 | Kubernetes & Observability | ✅ Draft ready |
 | 5 | Infrastructure as Code, with a Real Target | ⏳ Not started |
 | 6 | Shift-Left Security: Designing the DevSecOps Pipeline | ⏳ Not started |
 | 7 | Supply Chain Security: SBOM, Image Signing & Policy Gates | ⏳ Not started |
