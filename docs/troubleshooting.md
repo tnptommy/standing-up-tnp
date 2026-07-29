@@ -338,3 +338,67 @@ ownership checked against the UID the container actually runs as — not
 assumed to be root or the host user. This bites hardest with JVM-based
 images (SonarQube, Elasticsearch, and similar) which very commonly run
 as a fixed non-root UID baked into the image.
+
+---
+
+## Ansible: "Timeout waiting for privilege escalation prompt" — Ubuntu only, Rocky fine
+
+**Symptom:** `--ask-become-pass` (or any interactive sudo become) times out
+against the two Ubuntu 26.04 lab VMs, every time, with every workaround —
+but works immediately against the Rocky 10 VMs on the same inventory, same
+playbook, same password:
+
+```
+[ERROR]: Task failed: Timeout (12s) waiting for privilege escalation prompt:
+```
+
+Ruled out along the way, in order: wrong password (sudo works fine
+interactively), stale SSH ControlPersist sockets (cleared `~/.ansible/cp/*`,
+no change), parallel fork race condition (`-f 1`, no change), password
+passed via `-e ansible_become_pass=...` instead of prompt (no change), MOTD
+hanging the SSH session (timed a plain `ssh -tt`, under half a second).
+
+**Root cause:** Ubuntu 26.04 ships **sudo-rs** — Canonical's Rust rewrite of
+sudo, made the default starting with 25.10 — instead of GNU sudo. Ansible
+sends a custom prompt string via `sudo -S -p "<marker>"` and scans the
+output for that exact marker to know when to feed the password. sudo-rs
+handles `-p`/`-S` differently: a manual test showed the prompt coming out
+wrapped as `[sudo: TESTPROMPT:] Password:` instead of the bare string
+Ansible asked for. Ansible's marker-matching logic never sees what it's
+looking for, and just waits until it times out — even though the password
+is correct and interactive `sudo` works perfectly.
+
+```bash
+# confirms the wrapping behavior directly
+ssh -tt user@ubuntu-host 'sudo -H -S -p "TESTPROMPT:" whoami'
+# prompt appears as: [sudo: TESTPROMPT:] Password:
+```
+
+**Fix:** Don't fight sudo-rs's prompt handling — remove the need for
+Ansible to parse a sudo prompt at all, by configuring passwordless sudo
+directly over a manual SSH session:
+
+```bash
+ssh tnpadmin@<ubuntu-host>
+echo "tnpadmin ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/tnpadmin
+sudo chmod 440 /etc/sudoers.d/tnpadmin
+exit
+```
+
+Once NOPASSWD is set, Ansible never sends a password through `become` in
+the first place, so the sudo-rs prompt-format mismatch becomes irrelevant.
+
+**Verify:**
+
+```bash
+ansible all -i inventory.ini -b -m shell -a 'whoami'
+# all hosts return root, no --ask-become-pass needed
+```
+
+**Lesson:** When an OS swaps a core utility for a rewrite (sudo → sudo-rs,
+in this case), tools that scrape specific output formats from that utility
+— not just its exit code — can break in ways that look like a connection
+or credentials problem, even though the underlying command works fine by
+hand. Worth checking "did a core utility change implementation" before
+assuming a config or network issue when only one OS in a mixed inventory
+misbehaves.
