@@ -640,3 +640,101 @@ own init system, SonarQube) at the start of a session before assuming it's
 still up from last time — and worth investigating whether `restart: always`
 in the compose file is actually being honored across VM power-cycles, not
 just container crashes.
+
+---
+
+## GitLab Omnibus: replacing a self-signed cert doesn't take effect after `reconfigure`
+
+**Symptom:** Same SAN-related TLS error as the earlier Harbor entry, this
+time on GitLab: `gitlab-runner register` and `gitlab-runner verify` both
+fail with `certificate relies on legacy Common Name field, use SANs
+instead`, even after generating a proper SAN cert and running
+`gitlab-ctl reconfigure`. `openssl s_client` against the GitLab port
+consistently returns nothing usable — the connection isn't presenting the
+new cert at all.
+
+**Root cause:** `gitlab-ctl reconfigure` is a Chef run that only touches
+services whose *configuration* it detects as changed. Replacing the `.crt`
+file on disk via `docker cp` doesn't change `gitlab.rb` itself, so Chef has
+nothing to diff against and doesn't restart nginx — the running nginx
+process keeps serving whatever certificate it loaded at its last actual
+start, regardless of what's now sitting on disk.
+
+**Fix:** Restart nginx explicitly instead of relying on `reconfigure` to
+infer that it should:
+
+```bash
+docker exec -it gitlab gitlab-ctl restart nginx
+```
+
+**Verify:**
+
+```bash
+openssl s_client -connect <gitlab-host>:8443 -servername gitlab.tnp.internal \
+  </dev/null 2>/dev/null | openssl x509 -noout -text \
+  | grep -A 2 "Subject Alternative Name"
+```
+
+**Lesson:** Same underlying lesson as the Harbor cert issue, one layer
+deeper: `gitlab-ctl reconfigure` is not equivalent to "restart everything
+and pick up new files." Chef-driven reconfigure tools infer what needs
+restarting from tracked config changes — replacing a file it doesn't watch
+(a cert dropped in via `docker cp` rather than referenced by a new
+`gitlab.rb` value) can leave the actual running service untouched. When a
+cert swap doesn't take effect after the "official" reload step, restart the
+specific service directly rather than trusting the higher-level reconfigure
+command to have covered it.
+
+---
+
+## GitLab Runner: "is removed" / 403 Forbidden despite a valid-looking token
+
+**Symptom:** `gitlab-runner register` fails with `Verifying runner... is
+removed` and a `403 Forbidden`, using a registration token that was copied
+from the GitLab UI shortly before.
+
+**Root cause:** Two compounding issues from repeated failed registration
+attempts while debugging the TLS problem above:
+
+1. Each interrupted or failed `register` call had still created a runner
+   record on the GitLab side (visible under Settings → CI/CD → Runners),
+   even though the local `gitlab-runner` container never successfully
+   registered. Re-running registration with an old token pointed at a
+   runner record that either belonged to a different attempt or had
+   already been revoked.
+2. Separately, manually retyping a long `glrt-...` token introduced a
+   single missing character at the end, producing `Verifying runner... is
+   not valid` — a different, more specific error than the 403.
+
+**Fix:**
+
+1. Delete all stale/duplicate runner entries from Settings → CI/CD →
+   Runners in the GitLab UI — leave none, to avoid ambiguity about which
+   token belongs to which runner record.
+2. Create exactly one new runner, and copy the registration token using the
+   UI's copy button — never retype it by hand.
+
+```bash
+sudo docker exec -it gitlab-runner gitlab-runner register \
+  --url https://gitlab.tnp.internal:8443 \
+  --token <copied, not typed> \
+  --executor docker \
+  --docker-image docker:27 \
+  --docker-privileged
+```
+
+**Verify:**
+
+```bash
+sudo docker exec -it gitlab-runner gitlab-runner verify
+# "is valid"
+```
+
+**Lesson:** GitLab runner authentication tokens (`glrt-...`) are long
+enough that manual transcription is a real source of failure — always copy
+them programmatically. And when debugging one problem (TLS, in this case)
+causes several registration attempts to fail partway through, check for
+orphaned runner records left behind by those attempts before assuming a
+fresh attempt with a "new" token will behave cleanly — stale, ambiguous
+state from earlier failures can produce misleading errors that look
+unrelated to the original problem.
