@@ -46,8 +46,8 @@ Windows Host (64GB RAM, VMware Workstation Pro)
 ├── cicd        GitLab CE · Harbor · SonarQube
 │
 └── 4x Linux VMs   Ansible targets
-    ├── rocky-01 / rocky-02    Rocky Linux 10
-    └── ubuntu-01 / ubuntu-02  Ubuntu 26.04 LTS
+    ├── web-rocky / db-rocky    Rocky Linux 10
+    └── web-ubuntu / db-ubuntu  Ubuntu 26.04 LTS
 ```
 
 AWS Free Tier is used as the real provisioning target for Terraform — because a lab that only ever runs `terraform apply` against local containers never teaches the parts that actually matter in production.
@@ -56,19 +56,19 @@ AWS Free Tier is used as the real provisioning target for Terraform — because 
 
 ## Series roadmap
 
-| Part | Title |
-|---|---|
-| 0 | Introduction: Why I Built an Enterprise-Realistic DevOps Lab |
-| 1 | Infrastructure Foundation |
-| 2 | Multi-OS Configuration Management with Ansible |
-| 3 | Building a Self-Hosted CI/CD Platform |
-| 4 | Kubernetes & Observability |
-| 5 | Infrastructure as Code, with a Real Target |
-| 6 | Shift-Left Security: Designing the DevSecOps Pipeline |
-| 7 | Supply Chain Security: SBOM, Image Signing & Policy Gates |
-| 8 | GitOps at Scale with ArgoCD |
-| 9 | Enterprise Practices: RBAC, SLO & Chaos Engineering |
-| 10 | Retrospective: What Building TNP Actually Taught Me |
+| Part | Title | Status |
+|---|---|---|
+| 0 | Introduction: Why I Built an Enterprise-Realistic DevOps Lab | ✅ Draft ready |
+| 1 | Infrastructure Foundation | ✅ Draft ready |
+| 2 | Multi-OS Configuration Management with Ansible | ✅ Draft ready |
+| 3 | Building a Self-Hosted CI/CD Platform | ✅ Draft ready |
+| 4 | Kubernetes & Observability | ⏳ Not started |
+| 5 | Infrastructure as Code, with a Real Target | ⏳ Not started |
+| 6 | Shift-Left Security: Designing the DevSecOps Pipeline | ⏳ Not started |
+| 7 | Supply Chain Security: SBOM, Image Signing & Policy Gates | ⏳ Not started |
+| 8 | GitOps at Scale with ArgoCD | ⏳ Not started |
+| 9 | Enterprise Practices: RBAC, SLO & Chaos Engineering | ⏳ Not started |
+| 10 | Retrospective: What Building TNP Actually Taught Me | ⏳ Not started |
 
 ---
 
