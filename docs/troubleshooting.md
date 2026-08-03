@@ -738,3 +738,192 @@ orphaned runner records left behind by those attempts before assuming a
 fresh attempt with a "new" token will behave cleanly — stale, ambiguous
 state from earlier failures can produce misleading errors that look
 unrelated to the original problem.
+
+---
+
+## HTTPS for SonarQube, and why one self-signed cert per service stopped scaling
+
+**Symptom / motivation:** GitLab and Harbor already had HTTPS via
+individually self-signed certificates. Adding a third — SonarQube, sitting
+behind an Nginx reverse proxy since it has no built-in TLS termination —
+meant a third cert to generate, a third cert to trust on every client, and
+a third thing to re-copy every time a runner or host needed to talk to it.
+
+**Decision:** Instead of a fourth self-signed cert, generate one internal
+root CA and sign all three services' certificates with it. Trust the CA
+once, everywhere, instead of trusting three unrelated certificates.
+
+```bash
+# on cicd
+mkdir -p ~/tnp-ca && cd ~/tnp-ca
+openssl genrsa -out tnp-ca.key 4096
+openssl req -x509 -new -nodes -key tnp-ca.key -sha256 -days 3650 \
+  -out tnp-ca.crt -subj "/CN=TNP Internal Root CA"
+
+# per service (gitlab, harbor, sonar), signed by the CA instead of self-signed
+openssl req -new -key SERVICE.key -out SERVICE.csr -config SERVICE.cnf
+openssl x509 -req -in SERVICE.csr -CA tnp-ca.crt -CAkey tnp-ca.key \
+  -CAcreateserial -out SERVICE.crt -days 365 -extensions v3_req -extfile SERVICE.cnf
+```
+
+Applied to each service (GitLab needs `gitlab-ctl reconfigure` + explicit
+nginx restart, same as the Part 3 lesson; Harbor needs `./prepare` re-run;
+the SonarQube Nginx proxy just needs a restart), trusted at the OS level on
+both `devbox` and `cicd` via `update-ca-certificates`, and — critically —
+copied into the GitLab Runner's mounted volume so job containers can trust
+it too:
+
+```toml
+# config.toml
+[runners.docker]
+  tls-ca-file = "/etc/gitlab-runner/certs/tnp-ca.crt"   # the CA, not a per-service cert
+  volumes = ["/cache", "...", "/srv/gitlab-runner/config/ca:/etc/gitlab-runner/ca:ro"]
+```
+
+**A basic prerequisite that's easy to skip:** the reverse proxy for
+SonarQube needs its own port, since Harbor already owns 443/80 on the same
+host. Nginx also ships a default site listening on 80 by default — leaving
+it enabled causes a bind conflict even when the new config only listens on
+a different port (9443, in this case). `rm
+/etc/nginx/sites-enabled/default` before anything else.
+
+**Lesson:** A single internal CA scales better than N self-signed
+certificates the moment N is more than one — every new service reuses the
+same trust relationship instead of adding a new one to distribute.
+
+---
+
+## Trusting a self-signed CA inside a CI job container — four layers, four separate failures
+
+**Symptom:** With the CA created and every server-side service updated,
+`sonarqube-check` still failed — but each fix revealed a new, different
+failure underneath, all inside the same `node:22-alpine` job container.
+
+### Layer 1 — DNS
+
+```
+getaddrinfo ENOTFOUND sonar.tnp.internal
+```
+Same root cause as the Part 3 GitLab/Harbor DNS issue: `extra_hosts` in
+`config.toml` needs every internal domain the job might reach, and a newly
+added service (SonarQube's new HTTPS domain) doesn't inherit trust from
+domains added earlier.
+
+```toml
+extra_hosts = ["gitlab.tnp.internal:...", "harbor.tnp.internal:...", "sonar.tnp.internal:..."]
+```
+
+### Layer 2 — Alpine doesn't have the destination directory yet
+
+```
+cp: can't create '/usr/local/share/ca-certificates/tnp-ca.crt': No such file or directory
+```
+`node:22-alpine` is minimal enough that `/usr/local/share/ca-certificates/`
+doesn't exist until the `ca-certificates` package is actually installed —
+copying a cert there before installing the package that owns that
+directory fails, unlike on Debian-based images where the path pre-exists.
+
+```bash
+apk add --no-cache ca-certificates openjdk21-jre   # first
+cp tnp-ca.crt /usr/local/share/ca-certificates/     # then this works
+update-ca-certificates
+```
+
+### Layer 3 — `keytool` succeeds, then fails, because `$JAVA_HOME` is empty
+
+```
+Certificate was added to keystore
+keytool error: java.io.FileNotFoundException: /lib/security/cacerts (No such file or directory)
+```
+The import itself worked — against the wrong (empty-prefixed) path.
+Installing `openjdk21-jre` via `apk` doesn't set `$JAVA_HOME`, unlike some
+other distros' Java packages. `$JAVA_HOME/lib/security/cacerts` silently
+became `/lib/security/cacerts` once `$JAVA_HOME` evaluated to nothing.
+
+```bash
+export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))
+```
+
+### Layer 4 — Java trusts the CA now; Node.js still doesn't
+
+```
+[ERROR] Bootstrapper: ... unable to verify the first certificate
+```
+`sonar-scanner-npm` has two halves: a Node.js "Bootstrapper" that fetches
+and launches the actual Java-based Scanner Engine. Getting the Java half to
+trust the CA (Layer 3) does nothing for the Node half — Node ships its own
+bundled CA store and doesn't read the OS certificate store by default,
+regardless of what `update-ca-certificates` did system-wide.
+
+```yaml
+variables:
+  NODE_EXTRA_CA_CERTS: /etc/gitlab-runner/ca/tnp-ca.crt
+```
+
+**Final correct order**, all four layers together:
+
+```yaml
+before_script:
+  - apk add --no-cache ca-certificates openjdk21-jre
+  - export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))
+  - cp /etc/gitlab-runner/ca/tnp-ca.crt /usr/local/share/ca-certificates/tnp-ca.crt
+  - update-ca-certificates
+  - keytool -import -trustcacerts -alias tnp-ca -file /etc/gitlab-runner/ca/tnp-ca.crt \
+      -keystore $JAVA_HOME/lib/security/cacerts -storepass changeit -noprompt
+variables:
+  NODE_EXTRA_CA_CERTS: /etc/gitlab-runner/ca/tnp-ca.crt
+```
+
+**Lesson:** "Trust this CA" is not one operation inside a container running
+multiple language runtimes — it's one operation *per runtime*, because
+each one (OS/OpenSSL, JVM, Node.js) maintains its own independent
+certificate store and none of them automatically defer to the others. A
+tool that's secretly two processes in a trenchcoat (Node bootstrapper +
+Java engine, in this case) inherits both runtimes' trust requirements, not
+either one alone.
+
+---
+
+## Git: `main` looked out of date because it actually was — three false "conflicts" in a row
+
+**Symptom:** After merging a fix, `git log --oneline main -5` on `devbox`
+kept showing only `Initial commit` — no sign of any of the merges just
+completed on GitLab. Creating a new branch from what looked like `main`
+kept producing merge conflicts and MRs stuck "N commits behind," even
+immediately after merging.
+
+**Root cause:** Not a Git bug and not a real conflict — `git checkout main`
+alone does not fetch or update anything. Every time a new feature branch
+was cut with `git checkout -b` from a stale local `main`, it inherited
+that staleness, and a subsequent MR against the real `origin/main`
+legitimately had diverging history to reconcile.
+
+```bash
+git log --oneline main -5   # only ever showed the local, stale main
+```
+
+vs. the fix:
+
+```bash
+git checkout main
+git fetch origin
+git reset --hard origin/main   # force local main to match remote exactly
+git log --oneline -5           # now shows the real history
+```
+
+A second, related trap: after `git branch -D` on a local branch whose
+remote counterpart was already deleted by GitLab's "delete source branch"
+option, `git push origin --delete` on that same branch name correctly
+errors with "remote ref does not exist" — that's not a failure, it's
+confirmation the branch is already gone. `git fetch --prune` clears the
+stale `remotes/origin/...` references left behind after this kind of
+GitLab-side auto-deletion.
+
+**Lesson:** `git checkout <branch>` switches HEAD; it does not sync
+anything with the remote. Any workflow that creates branches from "main"
+without an explicit `git fetch` + `reset --hard origin/main` (or at
+minimum `git pull`) immediately before doing so is building on
+potentially stale ground — and the resulting conflicts look like content
+problems even though the actual cause is simply an out-of-date local
+ref.
+
